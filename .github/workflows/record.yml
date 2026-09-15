@@ -27,6 +27,8 @@ jobs:
 
       - name: Install dependencies
         run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends ffmpeg
           python -m pip install --upgrade pip
           pip install requests
           ffmpeg -version | head -n 1
