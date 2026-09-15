@@ -1,0 +1,54 @@
+name: Record X Broadcast
+
+on:
+  workflow_dispatch:
+    inputs:
+      broadcast_url:
+        description: "X/Twitter broadcast URL"
+        required: true
+        default: "https://x.com/i/broadcasts/1AxRnZbVpjaxl"
+      max_minutes:
+        description: "Max recording duration (minutes)"
+        required: false
+        default: "300"
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+          ffmpeg -version | head -n 1
+          df -h /
+
+      - name: Record broadcast
+        env:
+          BROADCAST_URL: ${{ inputs.broadcast_url }}
+          MAX_MINUTES: ${{ inputs.max_minutes }}
+        run: python record.py "$BROADCAST_URL" "$MAX_MINUTES"
+
+      - name: List outputs
+        if: always()
+        run: ls -lh downloads/ 2>/dev/null || true
+
+      - name: Upload recording
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: broadcast-recording
+          path: |
+            downloads/*.mp4
+            downloads/*.ts
+          retention-days: 7
+          if-no-files-found: warn
