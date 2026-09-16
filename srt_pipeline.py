@@ -187,14 +187,18 @@ def stage_transcribe():
 
 
 # ----------------------------------------------------------- stage: translate
-TRANSLATE_PROMPT = """You are a professional Persian (Farsi) subtitle translator for __CTX__.
-Translate every English subtitle segment into natural, conversational Persian. Keep proper names, product names and numbers in Latin script. Preserve tone and energy; keep each translation short and subtitle-friendly. Never invent or merge content.
-Return ONLY a JSON object (no markdown fences) shaped exactly:
-{"translations": [{"id": 1, "fa": "ترجمهٔ فارسی"}]}
-covering EVERY input id, same order.
+TRANSLATE_PROMPT = '''You are a professional Persian (Farsi) subtitle translator for __CTX__.
+Below is a numbered list of English subtitle segments. Translate EVERY segment into natural, conversational Persian. Keep proper names, product names and numbers in Latin script. Preserve tone and energy; keep each translation short and subtitle-friendly. Never invent or merge content.
+
+Output format - EXACTLY one line per segment, nothing else (no markdown, no fences, no blank lines between lines):
+id | Persian translation
+
+Example:
+17 | خب، بذار شروع کنیم
+18 | سلام، من لورن هستم
 
 Segments:
-__SEGS__"""
+__SEGS__'''
 
 
 def gemini_generate(model, payload, retries=4):
@@ -216,6 +220,24 @@ def gemini_generate(model, payload, retries=4):
     raise RuntimeError("gemini retries exhausted")
 
 
+def parse_line_translations(text: str) -> dict:
+    """Parse 'id | translation' lines; tolerate wrapped continuation lines."""
+    fa_by_id = {}
+    last_id = None
+    line_re = re.compile(r"^\s*(\d{1,5})\s*\|\s*(.*)$")
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = line_re.match(line)
+        if m:
+            last_id = int(m.group(1))
+            fa_by_id[last_id] = m.group(2).strip()
+        elif last_id is not None and not line.startswith(("```", "Segments")):
+            fa_by_id[last_id] += " " + line
+    return fa_by_id
+
+
 def stage_translate():
     if not GEMINI_KEY:
         raise RuntimeError("GEMINI_API_KEY is not set")
@@ -233,41 +255,34 @@ def stage_translate():
             log(f"translate: batch {bi + 1}/{len(batches)} cached")
             continue
         base = bi * BATCH_SIZE
-        items = [{"id": base + k + 1, "text": s["text"]}
+        lines = [f"{base + k + 1} | {s['text']}"
                  for k, s in enumerate(batch)]
         prompt = (TRANSLATE_PROMPT
                   .replace("__CTX__", VIDEO_CTX)
-                  .replace("__SEGS__", json.dumps(items, ensure_ascii=False)))
+                  .replace("__SEGS__", "\n".join(lines)))
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"responseMimeType": "application/json",
-                                 "temperature": 0.2,
+            "generationConfig": {"temperature": 0.2,
                                  "maxOutputTokens": 65536},
         }
         resp = gemini_generate(TRANSLATE_MODEL, payload)
         text = resp["candidates"][0]["content"]["parts"][0]["text"]
-        text = re.sub(r"^```(json)?|```$", "", text.strip(), flags=re.M).strip()
-        try:
-            doc = json.loads(text)
-        except json.JSONDecodeError:
-            m = re.search(r"\{.*\}", text, re.S)
-            if not m:
-                raise
-            doc = json.loads(m.group(0))
+        fa_by_id = parse_line_translations(text)
+        if len(fa_by_id) < len(batch) * 0.8:
+            log(f"translate: batch {bi + 1} partial coverage "
+                f"({len(fa_by_id)}/{len(batch)}), raw head: "
+                f"{text[:200]!r}")
         tmp = Path(str(dest) + ".tmp")
-        tmp.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(json.dumps(fa_by_id, ensure_ascii=False),
+                       encoding="utf-8")
         tmp.rename(dest)
         log(f"translate: batch {bi + 1}/{len(batches)} -> "
-            f"{len(doc.get('translations', []))} translations")
+            f"{len(fa_by_id)} translations")
         time.sleep(1)
     # merge
     fa_by_id = {}
     for f in sorted(tr_dir.glob("batch_*.json")):
-        for t in json.loads(f.read_text()).get("translations", []):
-            try:
-                fa_by_id[int(t["id"])] = str(t.get("fa", "") or "")
-            except (TypeError, ValueError):
-                continue
+        fa_by_id.update(json.loads(f.read_text()))
     out_segs = []
     for i, s in enumerate(segs):
         out_segs.append({"id": i + 1, "start": s["start"], "end": s["end"],
