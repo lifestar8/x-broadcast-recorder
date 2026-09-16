@@ -1,0 +1,68 @@
+name: Dub Broadcast (Gemini)
+
+on:
+  workflow_dispatch:
+    inputs:
+      broadcast_url:
+        description: "X/Twitter broadcast URL"
+        required: true
+        default: "https://x.com/i/broadcasts/1AxRnZbVpjaxl"
+      start_min:
+        description: "Start minute"
+        required: false
+        default: "0"
+      duration_min:
+        description: "Chunk length (minutes of content)"
+        required: false
+        default: "15"
+      rpm:
+        description: "TTS requests-per-minute budget"
+        required: false
+        default: "10"
+      stages:
+        description: "Stages: all | prep,analyze,tts,assemble (subset)"
+        required: false
+        default: "all"
+
+jobs:
+  dub:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          python -m pip install --upgrade pip
+          pip install requests numpy
+
+      - name: Run dubbing pipeline
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          BROADCAST_URL: ${{ inputs.broadcast_url }}
+          START_MIN: ${{ inputs.start_min }}
+          DURATION_MIN: ${{ inputs.duration_min }}
+          RPM: ${{ inputs.rpm }}
+          STAGES: ${{ inputs.stages }}
+        run: python dub_pipeline.py
+
+      - name: Upload outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dub-output-min${{ inputs.start_min }}-${{ inputs.duration_min }}
+          path: |
+            out/dubbed.mp4
+            out/subtitles.srt
+            out/segments.json
+            out/state.json
+          retention-days: 14
+          if-no-files-found: warn
