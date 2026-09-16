@@ -121,10 +121,10 @@ ANALYZE_PROMPT = """You are a professional subtitle and dubbing engine. Listen t
 Rules:
 - Timestamps in precise seconds measured from the very beginning of THIS audio chunk (the chunk starts at second 0).
 - Cluster all speech into speakers (S1, S2, ...) by voice characteristics; add gender (male/female/unknown) and a short description per speaker.
-{speakers_ctx}- Segment at sentence boundaries; each segment 2-12 seconds long.
+__SPEAKERS_CTX__- Segment at sentence boundaries; each segment 2-12 seconds long.
 - "fa" = natural, conversational Persian (Farsi) translation preserving the tone and energy; keep proper names in Latin script.
 - Skip non-speech regions (music, silence, applause). Never invent content.
-{edges}- Return ONLY the JSON object."""
+__EDGES__- Return ONLY the JSON object."""
 
 
 def norm_text(t: str) -> str:
@@ -173,8 +173,9 @@ def analyze_window(audio: Path, w0: float, wdur: float, wi: int, nw: int,
     if wi < nw - 1:
         edges.append("- This chunk may end mid-sentence: skip incomplete "
                      "speech at its very end.")
-    prompt = ANALYZE_PROMPT.format(speakers_ctx=speakers_ctx,
-                                   edges="\n".join(edges) + "\n" if edges else "")
+    prompt = (ANALYZE_PROMPT
+              .replace("__SPEAKERS_CTX__", speakers_ctx)
+              .replace("__EDGES__", ("\n".join(edges) + "\n") if edges else ""))
     payload = {
         "contents": [{"parts": [
             {"text": prompt},
