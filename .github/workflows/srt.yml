@@ -1,0 +1,74 @@
+name: Persian SRT (Groq Whisper + Gemini)
+
+on:
+  workflow_dispatch:
+    inputs:
+      broadcast_url:
+        description: "X/Twitter broadcast URL"
+        required: true
+        default: "https://x.com/i/broadcasts/1AxRnZbVpjaxl"
+      start_min:
+        description: "Start minute"
+        required: false
+        default: "0"
+      duration_min:
+        description: "Chunk length (minutes of content)"
+        required: false
+        default: "15"
+      whisper_model:
+        description: "Groq Whisper model"
+        required: false
+        default: "whisper-large-v3"
+      batch_size:
+        description: "Segments per Gemini translation batch"
+        required: false
+        default: "60"
+      stages:
+        description: "Stages: all | prep,transcribe,translate,srt"
+        required: false
+        default: "all"
+
+jobs:
+  srt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run subtitle pipeline
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          BROADCAST_URL: ${{ inputs.broadcast_url }}
+          START_MIN: ${{ inputs.start_min }}
+          DURATION_MIN: ${{ inputs.duration_min }}
+          WHISPER_MODEL: ${{ inputs.whisper_model }}
+          BATCH_SIZE: ${{ inputs.batch_size }}
+          STAGES: ${{ inputs.stages }}
+        run: python srt_pipeline.py
+
+      - name: Upload outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: srt-output-min${{ inputs.start_min }}-${{ inputs.duration_min }}
+          path: |
+            out/subtitles.srt
+            out/whisper.json
+            out/segments.json
+            out/state.json
+          retention-days: 14
+          if-no-files-found: warn
