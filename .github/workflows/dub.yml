@@ -23,6 +23,10 @@ on:
         description: "Stages: all | prep,analyze,tts,assemble (subset)"
         required: false
         default: "all"
+      smoke:
+        description: "Optional: limit TTS to first N segments (smoke test)"
+        required: false
+        default: ""
 
 jobs:
   dub:
@@ -52,6 +56,7 @@ jobs:
           DURATION_MIN: ${{ inputs.duration_min }}
           RPM: ${{ inputs.rpm }}
           STAGES: ${{ inputs.stages }}
+          SMOKE: ${{ inputs.smoke }}
         run: python dub_pipeline.py
 
       - name: Upload outputs

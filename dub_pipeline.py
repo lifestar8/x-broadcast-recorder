@@ -106,7 +106,10 @@ def stage_prep():
 
 
 # ------------------------------------------------------------- stage: analyze
-ANALYZE_PROMPT = """You are a professional subtitle and dubbing engine. Listen to this audio and return ONLY a valid JSON object (no markdown fences) with this exact shape:
+ANALYZE_WINDOW_S = float(os.environ.get("ANALYZE_WINDOW_S", "300"))
+ANALYZE_OVERLAP_S = float(os.environ.get("ANALYZE_OVERLAP_S", "20"))
+
+ANALYZE_PROMPT = """You are a professional subtitle and dubbing engine. Listen to this audio chunk and return ONLY a valid JSON object (no markdown fences) with this exact shape:
 
 {
   "speakers": [{"id": "S1", "gender": "male", "description": "short English description: gender, age group, role/mood"}],
@@ -116,12 +119,16 @@ ANALYZE_PROMPT = """You are a professional subtitle and dubbing engine. Listen t
 }
 
 Rules:
-- Timestamps in precise seconds measured from the very beginning of the audio.
+- Timestamps in precise seconds measured from the very beginning of THIS audio chunk (the chunk starts at second 0).
 - Cluster all speech into speakers (S1, S2, ...) by voice characteristics; add gender (male/female/unknown) and a short description per speaker.
-- Segment at sentence boundaries; each segment 2-12 seconds long.
+{speakers_ctx}- Segment at sentence boundaries; each segment 2-12 seconds long.
 - "fa" = natural, conversational Persian (Farsi) translation preserving the tone and energy; keep proper names in Latin script.
 - Skip non-speech regions (music, silence, applause). Never invent content.
-- Return ONLY the JSON object."""
+{edges}- Return ONLY the JSON object."""
+
+
+def norm_text(t: str) -> str:
+    return re.sub(r"[^\w\u0600-\u06FF]+", "", t or "").lower()
 
 
 def gemini_generate(model, payload, retries=4):
@@ -142,12 +149,35 @@ def gemini_generate(model, payload, retries=4):
     raise RuntimeError("gemini retries exhausted")
 
 
-def stage_analyze():
-    audio = OUT / "audio.mp3"
-    data = base64.b64encode(audio.read_bytes()).decode()
+def analyze_window(audio: Path, w0: float, wdur: float, wi: int, nw: int,
+                   known_speakers: list) -> dict:
+    chunk = OUT / f"_awin_{wi:02d}.mp3"
+    rc = run_ffmpeg(["-ss", f"{w0:.2f}", "-t", f"{wdur:.2f}",
+                     "-i", audio.as_posix(), "-c", "copy",
+                     chunk.as_posix()])
+    if rc != 0 or not chunk.exists() or chunk.stat().st_size < 1000:
+        raise RuntimeError(f"analyze: window {wi} audio cut failed")
+    data = base64.b64encode(chunk.read_bytes()).decode()
+    speakers_ctx = ""
+    if known_speakers:
+        speakers_ctx = (
+            "- Speakers already identified earlier in this recording; REUSE "
+            "their ids when you hear the same voice:\n" +
+            "\n".join(f"  * {s['id']}: {s.get('gender','?')}, "
+                      f"{s.get('description','')}" for s in known_speakers) + "\n"
+        )
+    edges = []
+    if wi > 0:
+        edges.append("- This chunk may begin mid-sentence: skip incomplete "
+                     "speech at its very start.")
+    if wi < nw - 1:
+        edges.append("- This chunk may end mid-sentence: skip incomplete "
+                     "speech at its very end.")
+    prompt = ANALYZE_PROMPT.format(speakers_ctx=speakers_ctx,
+                                   edges="\n".join(edges) + "\n" if edges else "")
     payload = {
         "contents": [{"parts": [
-            {"text": ANALYZE_PROMPT},
+            {"text": prompt},
             {"inline_data": {"mime_type": "audio/mpeg", "data": data}},
         ]}],
         "generationConfig": {"responseMimeType": "application/json",
@@ -163,31 +193,102 @@ def stage_analyze():
         if not m:
             raise
         doc = json.loads(m.group(0))
-    segs = doc.get("segments", [])
-    if not segs:
-        raise RuntimeError("analyze: no segments returned")
-    for i, s in enumerate(segs):
+    chunk.unlink(missing_ok=True)
+    return doc
+
+
+def stage_analyze():
+    audio = OUT / "audio.mp3"
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", audio.as_posix()],
+        capture_output=True, text=True)
+    try:
+        total_dur = float(probe.stdout.strip())
+    except ValueError:
+        total_dur = float(os.environ.get("DURATION_MIN", "15")) * 60
+    log(f"analyze: audio duration {total_dur:.1f}s")
+
+    win, ov = ANALYZE_WINDOW_S, ANALYZE_OVERLAP_S
+    windows = []
+    t0 = 0.0
+    while t0 < total_dur - 0.5:
+        windows.append((t0, min(win, total_dur - t0)))
+        t0 += win - ov
+    log(f"analyze: {len(windows)} window(s) of {win:.0f}s, overlap {ov:.0f}s")
+
+    known = []
+    per_win = []
+    for wi, (w0, wdur) in enumerate(windows):
+        log(f"analyze: window {wi + 1}/{len(windows)} at {w0:.0f}s "
+            f"({wdur:.0f}s long)")
         try:
-            s["id"] = int(s.get("id", i + 1))
-        except (TypeError, ValueError):
-            s["id"] = i + 1
-        s["speaker"] = str(s.get("speaker", "S1"))
-        try:
-            s["start"] = float(s.get("start", 0.0))
-        except (TypeError, ValueError):
-            s["start"] = 0.0
-        try:
-            s["end"] = float(s.get("end", s["start"] + 2.0))
-        except (TypeError, ValueError):
-            s["end"] = s["start"] + 2.0
-        if s["end"] <= s["start"]:
-            s["end"] = s["start"] + 2.0
-        s.setdefault("fa", "")
+            doc = analyze_window(audio, w0, wdur, wi, len(windows), known)
+        except Exception as e:
+            log(f"analyze: window {wi + 1} FAILED: {e} (skipping window)")
+            per_win.append([])
+            continue
+        for sp in doc.get("speakers", []):
+            if sp.get("id") and not any(k.get("id") == sp["id"] for k in known):
+                known.append(sp)
+        wsegs = []
+        for s in doc.get("segments", []):
+            try:
+                st = float(s.get("start", 0.0))
+            except (TypeError, ValueError):
+                st = 0.0
+            try:
+                en = float(s.get("end", st + 2.0))
+            except (TypeError, ValueError):
+                en = st + 2.0
+            if en <= st:
+                en = st + 2.0
+            wsegs.append({
+                "start": st + w0, "end": en + w0,
+                "speaker": str(s.get("speaker", "S1")),
+                "text": str(s.get("text", "") or ""),
+                "fa": str(s.get("fa", "") or ""),
+                "_win": wi,
+            })
+        log(f"analyze: window {wi + 1} -> {len(wsegs)} segments, "
+            f"{len(doc.get('speakers', []))} speakers")
+        per_win.append(wsegs)
+
+    all_segs = list(per_win[0]) if per_win else []
+    for wi in range(1, len(per_win)):
+        if not per_win[wi]:
+            continue
+        w0 = windows[wi][0]
+        boundary = w0 + ov
+        recent = [s for s in all_segs if s["start"] >= w0 - 5.0]
+        added = 0
+        for s in per_win[wi]:
+            dup = False
+            if s["start"] < boundary:
+                nt = norm_text(s["text"])
+                for p in recent:
+                    pt = norm_text(p["text"])
+                    if nt and pt and len(nt) >= 8 and len(pt) >= 8 and \
+                            (nt[:50] == pt[:50] or nt in pt or pt in nt):
+                        dup = True
+                        break
+            if not dup:
+                all_segs.append(s)
+                added += 1
+        log(f"analyze: merged window {wi + 1}: +{added} new segments "
+            f"(dedup at boundary {boundary:.0f}s)")
+
+    all_segs.sort(key=lambda s: (s["start"], s.get("_win", 0)))
+    for i, s in enumerate(all_segs):
+        s["id"] = i + 1
+        s.pop("_win", None)
+    if not all_segs:
+        raise RuntimeError("analyze: no segments returned in any window")
     (OUT / "segments.json").write_text(
-        json.dumps(doc, ensure_ascii=False, indent=1))
-    log(f"analyze done: {len(segs)} segments, "
-        f"{len(doc.get('speakers', []))} speakers")
-    save_state(analyze="done", segments=len(segs))
+        json.dumps({"speakers": known, "segments": all_segs},
+                   ensure_ascii=False, indent=1))
+    log(f"analyze done: {len(all_segs)} segments, {len(known)} speakers")
+    save_state(analyze="done", segments=len(all_segs))
 
 
 # ----------------------------------------------------------------- stage: tts
@@ -211,15 +312,21 @@ class RateLimiter:
 def tts_one(text, voice, dest: Path, limiter: RateLimiter):
     if dest.exists() and dest.stat().st_size > 1000:
         return
-    payload = {
-        "contents": [{"parts": [{"text": f"با لحن طبیعی و محاوره‌ای فارسی بخوان:\n{text}"}]}],
-        "generationConfig": {
-            "responseModalities": ["AUDIO"],
-            "speechConfig": {"voiceConfig": {
-                "prebuiltVoiceConfig": {"voiceName": voice}}},
-        },
+    prompts = [
+        f"با لحن طبیعی و محاوره‌ای فارسی بخوان:\n{text}",
+        f"Read the following Persian text aloud, naturally and "
+        f"conversationally:\n{text}",
+    ]
+    base_cfg = {
+        "responseModalities": ["AUDIO"],
+        "speechConfig": {"voiceConfig": {
+            "prebuiltVoiceConfig": {"voiceName": voice}}},
     }
     for attempt in range(5):
+        payload = {
+            "contents": [{"parts": [{"text": prompts[attempt % len(prompts)]}]}],
+            "generationConfig": base_cfg,
+        }
         limiter.wait()
         r = requests.post(
             f"{API_BASE}/models/{TTS_MODEL}:generateContent",
@@ -227,7 +334,11 @@ def tts_one(text, voice, dest: Path, limiter: RateLimiter):
             json=payload, timeout=300,
         )
         if r.status_code == 200:
-            parts = r.json()["candidates"][0]["content"]["parts"]
+            resp = r.json()
+            cands = resp.get("candidates") or []
+            parts = []
+            if cands and isinstance(cands[0], dict):
+                parts = (cands[0].get("content") or {}).get("parts") or []
             for p in parts:
                 if "inlineData" in p:
                     pcm = base64.b64decode(p["inlineData"]["data"])
@@ -240,14 +351,19 @@ def tts_one(text, voice, dest: Path, limiter: RateLimiter):
                         w.writeframes(pcm)
                     tmp.rename(dest)
                     return
-            raise RuntimeError("tts: no audio in response")
+            fr = cands[0].get("finishReason") if cands and isinstance(cands[0], dict) \
+                else "no-candidates"
+            log(f"tts: empty response (finishReason={fr}) attempt {attempt+1}/5 "
+                f"body={json.dumps(resp, ensure_ascii=False)[:240]}")
+            time.sleep(8 * (attempt + 1))
+            continue
         if r.status_code in (429, 500, 503):
             wait = 20 * (attempt + 1)
             log(f"tts {r.status_code}, retry in {wait}s")
             time.sleep(wait)
             continue
         raise RuntimeError(f"tts -> {r.status_code}: {r.text[:300]}")
-    raise RuntimeError(f"tts retries exhausted (voice={voice})")
+    raise RuntimeError(f"tts empty/blocked after retries (voice={voice})")
 
 
 def stage_tts():
@@ -270,6 +386,10 @@ def stage_tts():
     limiter = RateLimiter(float(os.environ.get("RPM", "10")))
     todo = [s for s in segs
             if not (TTS_DIR / f"seg_{s['id']:05d}.wav").exists()]
+    smoke = int(os.environ.get("SMOKE", "0") or 0)
+    if smoke > 0:
+        todo = todo[:smoke]
+        log(f"SMOKE mode: limiting TTS to first {smoke} segments")
     log(f"tts: {len(todo)}/{len(segs)} segments to synthesize")
     for k, s in enumerate(todo):
         fa = (s.get("fa") or "").strip()
