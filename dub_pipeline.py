@@ -156,12 +156,32 @@ def stage_analyze():
     resp = gemini_generate(ANALYZE_MODEL, payload)
     text = resp["candidates"][0]["content"]["parts"][0]["text"]
     text = re.sub(r"^```(json)?|```$", "", text.strip(), flags=re.M).strip()
-    doc = json.loads(text)
+    try:
+        doc = json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", text, re.S)
+        if not m:
+            raise
+        doc = json.loads(m.group(0))
     segs = doc.get("segments", [])
     if not segs:
         raise RuntimeError("analyze: no segments returned")
     for i, s in enumerate(segs):
-        s.setdefault("speaker", "S1")
+        try:
+            s["id"] = int(s.get("id", i + 1))
+        except (TypeError, ValueError):
+            s["id"] = i + 1
+        s["speaker"] = str(s.get("speaker", "S1"))
+        try:
+            s["start"] = float(s.get("start", 0.0))
+        except (TypeError, ValueError):
+            s["start"] = 0.0
+        try:
+            s["end"] = float(s.get("end", s["start"] + 2.0))
+        except (TypeError, ValueError):
+            s["end"] = s["start"] + 2.0
+        if s["end"] <= s["start"]:
+            s["end"] = s["start"] + 2.0
         s.setdefault("fa", "")
     (OUT / "segments.json").write_text(
         json.dumps(doc, ensure_ascii=False, indent=1))
