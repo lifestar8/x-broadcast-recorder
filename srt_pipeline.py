@@ -279,10 +279,14 @@ def stage_translate():
         log(f"translate: batch {bi + 1}/{len(batches)} -> "
             f"{len(fa_by_id)} translations")
         time.sleep(1)
-    # merge
+    # merge (JSON keys are strings; normalize back to int)
     fa_by_id = {}
     for f in sorted(tr_dir.glob("batch_*.json")):
-        fa_by_id.update(json.loads(f.read_text()))
+        for k, v in json.loads(f.read_text()).items():
+            try:
+                fa_by_id[int(k)] = str(v or "")
+            except (TypeError, ValueError):
+                continue
     out_segs = []
     for i, s in enumerate(segs):
         out_segs.append({"id": i + 1, "start": s["start"], "end": s["end"],
